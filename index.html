@@ -184,24 +184,6 @@
       </div>
 
       <!-- ============================================================
-           EXPERIMENTAL — SharePoint Direct File Load connectivity test
-           (temporary; isolated from the real upload/calculation flow —
-           see spTestConnection() near the end of the script). Safe to
-           delete this whole block later with no effect on anything else.
-           ============================================================ -->
-      <div class="mt-6 p-4 rounded-xl border border-dashed border-purple-300 bg-purple-50/40">
-        <div class="flex items-center justify-between flex-wrap gap-3">
-          <div>
-            <p class="text-sm font-bold text-purple-800">🧪 Experimental — SharePoint Direct File Load</p>
-            <p class="text-xs text-slate-500 mt-0.5">Connectivity test only (Capacity file). Does not affect the upload workflow above or Start Analysis.</p>
-          </div>
-          <button id="spTestBtn" type="button" onclick="spTestConnection()" class="px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-slate-300 text-white text-xs font-bold rounded-lg shadow transition-all flex items-center gap-2">
-            <span>🔄</span> Test SharePoint Connection
-          </button>
-        </div>
-      </div>
-
-      <!-- ============================================================
            Power Automate + SharePoint automated data load (optional).
            Loads Capacity/Routing/Plan via a Power Automate HTTP flow
            into the SAME planData/routingData/capacityData that manual
@@ -4669,7 +4651,8 @@
     // =====================================================================
     // FIX #14 – Main orchestrator
     // =====================================================================
-    function processData() {
+    function processData(options) {
+      const autoContinue = !!(options && options.autoContinue);
       log('processData started...');
       showProgress(true);
       updateProgress(5, 'جاري التحقق من البيانات...');
@@ -4681,6 +4664,33 @@
 
         // Step 2 – Validate
         const isValid = validateData(routingMap);
+
+        // Automatic mode (paLoadFactoryData(), after a successful Power
+        // Automate load): if validation passed — including when it only
+        // produced non-blocking warnings, since isValid is already exactly
+        // "no blocking error" per validateData()'s own !hasError contract
+        // above — proceed straight through to analysis exactly as if the
+        // user had clicked "Continue Analysis" themselves, via the SAME
+        // runAnalysis() call manual mode uses below. The validation report
+        // is intentionally left un-rendered here: validateData() already
+        // ran for real and is the single source of truth for `isValid`;
+        // nothing is bypassed, there is simply no confirmation left to ask
+        // for when nothing needs confirming. A genuine BLOCKING error
+        // (isValid === false) always falls through to the untouched
+        // manual-mode code below instead — auto mode never overrides a
+        // real error.
+        if (autoContinue && isValid) {
+          updateProgress(30, 'جاري تحليل البيانات...');
+          runAnalysis(wcMap, routingMap, isValid);
+          // runAnalysis() ends by calling showMainMenu() internally — that
+          // is existing, unchanged behavior for the normal manual flow.
+          // It is fully synchronous with no await/yield point, so calling
+          // showCapacityPlanningArea() immediately afterward overrides
+          // that navigation before the browser ever paints the Main Menu
+          // state; the user never sees Main Menu appear.
+          showCapacityPlanningArea();
+          return true;
+        }
 
         // Step 3 – Show validation report; ALWAYS wait for user to confirm before continuing
         renderValidationWarnings(() => {
@@ -12675,160 +12685,6 @@
     });
 
     // ════════════════════════════════════════════════════════════════════
-    //  EXPERIMENTAL — SharePoint Direct File Load connectivity test
-    //  (temporary; deliberately isolated from the rest of the app).
-    //
-    //  What this does: a single plain fetch() of the SharePoint sharing
-    //  link below, then inspects whatever the browser actually returned.
-    //  What this deliberately does NOT do:
-    //    - No credentials/tokens are read, attached, or displayed. The
-    //      `credentials: 'include'` option below only tells the browser to
-    //      send cookies it ALREADY holds for sharepoint.com, exactly as it
-    //      would for a normal page navigation — nothing here reads
-    //      document.cookie or any auth header.
-    //    - No CORS bypass of any kind (no proxy, no no-cors/opaque mode,
-    //      no JSONP/script-tag trick) — `mode: 'cors'` is the standard,
-    //      transparent request mode, so a real failure surfaces as a real
-    //      error instead of a fake "success".
-    //    - The fetched Blob is never written into fileCapacity, the
-    //      workCenters/wcMonthlyData state, or any other application
-    //      state, and processData()/the real Excel-parsing pipeline is
-    //      never called. The ONLY thing touched is the standalone
-    //      spTestStatus panel below the upload cards.
-    //    - The result is verified with the SAME SheetJS (XLSX) library the
-    //      app already loads, via a plain XLSX.read() call whose result is
-    //      immediately discarded — no second parser is created.
-    //  Safe to delete this entire block (and the matching HTML block near
-    //  the Plan/Routing/Capacity upload cards) later with zero effect on
-    //  anything else in the file.
-    // ════════════════════════════════════════════════════════════════════
-    const SP_TEST_CAPACITY_URL = 'https://elarabygroup2.sharepoint.com/:x:/s/ELA-M365ET341/IQCVb9lUHszsS4ZlF4tRWM41AW8oWNj7qOzc3u1ahLkrCGY?e=LrNT2i';
-
-    function spEscape(s) {
-      return String(s === null || s === undefined ? '' : s)
-        .replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    }
-    function spRenderStatus(html) {
-      const el = document.getElementById('spTestStatus');
-      if (!el) return;
-      el.classList.remove('hidden');
-      el.innerHTML = html;
-    }
-    function spFailurePanel(reason, details) {
-      const rows = (details || []).map(([label, value]) =>
-        `<p class="text-slate-600"><span class="font-semibold">${spEscape(label)}:</span> ${spEscape(value)}</p>`).join('');
-      spRenderStatus(`
-        <div class="p-3 rounded-lg border border-red-200 bg-red-50 space-y-1">
-          <p class="font-bold text-red-700">🔴 SharePoint file could not be loaded</p>
-          <p class="text-red-700"><span class="font-semibold">Possible reason:</span> ${spEscape(reason)}</p>
-          ${rows}
-        </div>`);
-    }
-    // Every .xlsx file is a ZIP container, so its first 4 bytes are always
-    // the ZIP local-file-header signature "PK\x03\x04". Checking this is a
-    // stronger guard than trusting the Content-Type header alone — a
-    // SharePoint sign-in/viewer HTML page will never produce these bytes,
-    // even if some intermediary mislabels Content-Type.
-    async function spLooksLikeXlsxBytes(blob) {
-      try {
-        const head = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
-        return head.length === 4 && head[0] === 0x50 && head[1] === 0x4B && head[2] === 0x03 && head[3] === 0x04;
-      } catch (e) { return false; }
-    }
-
-    async function spTestConnection() {
-      const btn = document.getElementById('spTestBtn');
-      if (btn) btn.disabled = true;
-      spRenderStatus('<div class="p-3 rounded-lg border border-slate-200 bg-white text-slate-500">Testing SharePoint connection...</div>');
-
-      try {
-        let resp;
-        try {
-          resp = await fetch(SP_TEST_CAPACITY_URL, { method: 'GET', credentials: 'include', mode: 'cors' });
-        } catch (err) {
-          // The browser throws here for CORS blocks, DNS/network failures,
-          // and mixed-content blocks alike, and deliberately does not say
-          // which — this is standard fetch() behavior, not a bug in this
-          // code. We surface exactly what the browser gave us.
-          spFailurePanel(
-            'CORS blocked, network error, or the link requires interactive sign-in (the browser does not reveal which).',
-            [['Error', `${err.name}: ${err.message}`], ['Note', 'This is the browser\'s own error, shown unmodified.']]
-          );
-          return;
-        }
-
-        const contentType = resp.headers.get('content-type') || '(not provided)';
-        const contentLength = resp.headers.get('content-length');
-
-        if (!resp.ok) {
-          spFailurePanel(
-            (resp.status === 401 || resp.status === 403) ? 'Authentication required / access denied.' : 'SharePoint returned an error response.',
-            [['HTTP Status', `${resp.status} ${resp.statusText || ''}`.trim()], ['Content-Type', contentType], ['Response URL', resp.url || '(unavailable)']]
-          );
-          return;
-        }
-
-        if (/text\/html/i.test(contentType)) {
-          spFailurePanel(
-            'SharePoint returned an HTML page instead of the Excel file (sign-in or viewer page). This response was NOT passed to the Excel parser.',
-            [['HTTP Status', String(resp.status)], ['Content-Type', contentType], ['Response URL', resp.url || '(unavailable)']]
-          );
-          return;
-        }
-
-        let blob;
-        try {
-          blob = await resp.blob();
-        } catch (err) {
-          spFailurePanel('The response body could not be read.', [['Error', `${err.name}: ${err.message}`]]);
-          return;
-        }
-
-        const isXlsxBytes = await spLooksLikeXlsxBytes(blob);
-        if (!isXlsxBytes) {
-          spFailurePanel(
-            'Content-Type looked plausible, but the file\'s own bytes do not match the .xlsx (ZIP) signature. This response was NOT passed to the Excel parser.',
-            [['HTTP Status', String(resp.status)], ['Content-Type', contentType]]
-          );
-          return;
-        }
-
-        // Genuine .xlsx bytes — sanity-check with the app's EXISTING
-        // SheetJS parser (read-only; result is discarded immediately and
-        // never written into any application state).
-        let parseNote = 'Not attempted';
-        try {
-          const buf = await blob.arrayBuffer();
-          const wb = (typeof XLSX !== 'undefined') ? XLSX.read(buf, { type: 'array' }) : null;
-          parseNote = (wb && wb.SheetNames && wb.SheetNames.length)
-            ? `Parsed OK - ${wb.SheetNames.length} sheet(s): ${wb.SheetNames.join(', ')}`
-            : 'XLSX library returned no sheets';
-        } catch (err) {
-          parseNote = `Parse failed: ${err.message}`;
-        }
-
-        const sizeKB = (blob.size / 1024).toFixed(1);
-        spRenderStatus(`
-          <div class="p-3 rounded-lg border border-green-200 bg-green-50 space-y-1">
-            <p class="font-bold text-green-700">🟢 SharePoint file loaded successfully</p>
-            <p class="text-slate-600"><span class="font-semibold">File:</span> Capacity.xlsx (test only - not applied to the app)</p>
-            <p class="text-slate-600"><span class="font-semibold">HTTP Status:</span> ${resp.status}</p>
-            <p class="text-slate-600"><span class="font-semibold">Content-Type:</span> ${spEscape(contentType)}</p>
-            <p class="text-slate-600"><span class="font-semibold">File Size:</span> ${sizeKB} KB${contentLength ? ` (Content-Length: ${spEscape(contentLength)})` : ''}</p>
-            <p class="text-slate-600"><span class="font-semibold">Existing XLSX parser check:</span> ${spEscape(parseNote)}</p>
-            <p class="text-slate-500 italic">Connectivity test only - nothing above was applied to the Capacity file, analysis, or app state.</p>
-          </div>`);
-      } catch (err) {
-        // Final safety net — should be unreachable given the try/catches
-        // above, but guarantees this feature can never produce an
-        // uncaught/unhandled-rejection console error.
-        spFailurePanel('Unexpected error while running the test.', [['Error', `${err.name}: ${err.message}`]]);
-      } finally {
-        if (btn) btn.disabled = false;
-      }
-    }
-
-    // ════════════════════════════════════════════════════════════════════
     //  Power Automate + SharePoint automated data load (optional path).
     //
     //  Architecture: HTML -> Power Automate (owns SharePoint auth) ->
@@ -12995,12 +12851,38 @@
           doneLines.push(`${paEscape(label)} ✓`);
         }
 
-        paRenderStatus(`
-          <div class="p-3 rounded-lg border border-green-200 bg-green-50 space-y-1">
-            <p class="font-bold text-green-700">🟢 SharePoint data loaded successfully</p>
-            ${doneLines.map(l => `<p class="text-slate-600">${l}</p>`).join('')}
-            <p class="text-slate-600">Factory data loaded successfully — click <span class="font-semibold">Start Analysis</span> below to continue.</p>
-          </div>`);
+        // All three files loaded and parsed by the REAL, unmodified
+        // parseExcel()/parseExcelCapacity() — planData/routingData/
+        // capacityData and filesLoaded are now exactly as they'd be after
+        // a manual three-file upload. Continue straight through the
+        // EXISTING pipeline (processData -> preprocessData -> validateData
+        // -> runAnalysis) with no separate "Start Analysis"/"Continue
+        // Analysis" click. A genuine blocking validation error still stops
+        // here and shows the real validation report, exactly as manual
+        // mode already does — auto mode never bypasses or hides an error.
+        paProgressPanel([...doneLines, 'Validating data...', 'Calculating...', 'Rendering dashboard...']);
+
+        const autoCompleted = processData({ autoContinue: true });
+
+        if (autoCompleted) {
+          paRenderStatus(`
+            <div class="p-3 rounded-lg border border-green-200 bg-green-50 space-y-1">
+              <p class="font-bold text-green-700">🟢 SharePoint data loaded successfully</p>
+              ${doneLines.map(l => `<p class="text-slate-600">${l}</p>`).join('')}
+              <p class="text-slate-600">Analysis complete — Capacity Planning is now open below.</p>
+            </div>`);
+        } else {
+          // processData() itself already rendered the real, existing
+          // validation/error report (renderValidationWarnings()) — this
+          // panel only points the user at it, it does not duplicate or
+          // reinterpret what that report says.
+          paRenderStatus(`
+            <div class="p-3 rounded-lg border border-amber-200 bg-amber-50 space-y-1">
+              <p class="font-bold text-amber-700">🟡 Files loaded, but validation needs your attention</p>
+              ${doneLines.map(l => `<p class="text-slate-600">${l}</p>`).join('')}
+              <p class="text-slate-600">See the Data Validation Report below — this is the same report manual upload would show.</p>
+            </div>`);
+        }
       } catch (err) {
         paFailurePanel('Unexpected error while loading factory data.', [['Error', `${err.name}: ${err.message}`]]);
       } finally {
