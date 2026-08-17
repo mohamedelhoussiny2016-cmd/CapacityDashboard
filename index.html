@@ -1922,9 +1922,11 @@
 
           <!-- ROW 4 — Routing (correction spec section 2) — machine-only,
                CASCADING selection: Factory -> Department -> Work Center ->
-               Machine Time (Minutes). No Labor Time. Department options
-               depend on the selected Factory; Work Center options depend on
-               BOTH the selected Factory AND Department — see
+               Production / Shift (Machine Time is derived: DIR_SHIFT_MINUTES
+               / Production per Shift — see dirReadRoutingRows()). No Labor
+               Time. Department options depend on the selected Factory; Work
+               Center options depend on BOTH the selected Factory AND
+               Department — see
                dirRoutingFactoryOptions()/dirRoutingDeptOptions()/dirRoutingWCOptions(). -->
           <div class="mb-3">
             <div class="flex justify-between items-center mb-1.5">
@@ -1937,7 +1939,7 @@
                   <th class="text-left px-3 py-1.5">Factory</th>
                   <th class="text-left px-3 py-1.5">Department</th>
                   <th class="text-left px-3 py-1.5">Work Center</th>
-                  <th class="text-left px-3 py-1.5">Machine Time (Minutes)</th>
+                  <th class="text-left px-3 py-1.5">Production / Shift</th>
                   <th class="px-3 py-1.5"></th>
                 </tr></thead>
                 <tbody id="dir_routingBody"></tbody>
@@ -9460,6 +9462,13 @@
     let _dirCurrentScenario = null;       // last scenario shown in dir_resultCard (for PDF export, spec section 19)
     let _dirCurrentResults  = null;
     const DIR_STORAGE_KEY = 'elaraby_director_ems_scenarios_v1';
+    // Fixed shift length (minutes) used ONLY to convert the EMS What-If
+    // routing input (Production / Shift) into the Machine Time (min/unit)
+    // the existing, untouched EMS engine already expects:
+    // Machine Time = DIR_SHIFT_MINUTES / Production per Shift. Centralized
+    // here — never hard-code 420 elsewhere (see dirReadRoutingRows(),
+    // dirAddRoutingRow(), dirRoutingRowHTML(), dirUpdateRoutingMT()).
+    const DIR_SHIFT_MINUTES = 420;
 
     // Executive-language labels for the Director Dashboard's per-month status
     // badges (spec sections 13/18: CAPACITY AVAILABLE / CAPACITY TIGHT / HIGH
@@ -9748,13 +9757,15 @@
     }
 
     // Routing rows — machine-only, CASCADING selection (correction spec
-    // section 2): Factory -> Department -> Work Center -> Machine Time
-    // (Minutes). Department options depend on the selected Factory; Work
-    // Center options depend on BOTH the selected Factory AND Department, so
-    // an unrelated Work Center can never be selected. Deliberately NO Labor
-    // Time field/column exists anywhere in this table. All three dropdowns
-    // are derived from the SAME existing `workCenters` master list — no
-    // separate/duplicated Factory-Department-WC mapping is introduced.
+    // section 2): Factory -> Department -> Work Center -> Production / Shift
+    // (Machine Time is derived from this — see DIR_SHIFT_MINUTES and
+    // dirReadRoutingRows()). Department options depend on the selected
+    // Factory; Work Center options depend on BOTH the selected Factory AND
+    // Department, so an unrelated Work Center can never be selected.
+    // Deliberately NO Labor Time field/column exists anywhere in this table.
+    // All three dropdowns are derived from the SAME existing `workCenters`
+    // master list — no separate/duplicated Factory-Department-WC mapping is
+    // introduced.
     function dirRoutingFactoryOptions() {
       const factories = [...new Set(workCenters.map(w => w.factory).filter(Boolean))].sort();
       return factories.map(f => `<option value="${_msEsc(f)}">${_msEsc(f)}</option>`).join('');
@@ -9775,7 +9786,13 @@
       // dropdown's .value is unaffected.
       return wcs.map(w => `<option value="${w.workCenter}">${_msEsc(wcDisplayLabel(w.workCenter))}</option>`).join('');
     }
-    function dirRoutingRowHTML(rowId, factory, department, wc, machTime) {
+    function dirRoutingRowHTML(rowId, factory, department, wc, productionShift) {
+      // Production / Shift is the ONLY user-facing input now; Machine Time
+      // (machineTimeMin) is derived (DIR_SHIFT_MINUTES / productionShift)
+      // and shown here purely as a read-only helper — dirReadRoutingRows()
+      // re-derives the authoritative value at read time.
+      const psVal = (productionShift !== undefined && productionShift !== null && productionShift !== '' && isFinite(productionShift)) ? productionShift : '';
+      const mtInit = (psVal !== '' && psVal > 0) ? (DIR_SHIFT_MINUTES / psVal).toFixed(3) : '—';
       return `<tr id="dir_routing_row_${rowId}">
         <td class="px-2.5 py-1.5">
           <select data-rrow="factory" onchange="dirOnRoutingFactoryChange(${rowId})" class="border border-slate-300 rounded-lg px-2 py-1.5 text-sm bg-white w-32">
@@ -9795,11 +9812,14 @@
             ${(factory && department) ? dirRoutingWCOptions(factory, department) : ''}
           </select>
         </td>
-        <td class="px-2.5 py-1.5"><input type="number" min="0" step="0.001" data-rrow="machTime" value="${machTime !== undefined && machTime !== null ? machTime : ''}" placeholder="0.000" class="w-24 border border-slate-300 rounded-lg px-2 py-1.5 text-sm"></td>
+        <td class="px-2.5 py-1.5">
+          <input type="number" min="0" step="1" data-rrow="productionShift" value="${psVal}" placeholder="1000" oninput="dirUpdateRoutingMT(${rowId})" class="w-24 border border-slate-300 rounded-lg px-2 py-1.5 text-sm">
+          <div class="text-[10px] text-slate-400 mt-0.5 whitespace-nowrap">M.T. = <span data-rrow="mtDisplay">${mtInit}</span> min/unit</div>
+        </td>
         <td class="px-2.5 py-1.5 text-center"><button onclick="dirDeleteRoutingRow(${rowId})" class="text-red-500 hover:text-red-700 font-bold text-sm">Delete</button></td>
       </tr>`;
     }
-    function dirAddRoutingRow(factory, department, wc, machTime) {
+    function dirAddRoutingRow(factory, department, wc, machineTimeMin, productionShift) {
       _dirRoutingRowCounter++;
       const rowId = _dirRoutingRowCounter;
       const body = document.getElementById('dir_routingBody');
@@ -9815,7 +9835,20 @@
           department = department || wcInfo.department || '';
         }
       }
-      body.insertAdjacentHTML('beforeend', dirRoutingRowHTML(rowId, factory, department, wc, machTime));
+      // Production/Shift vs. Machine Time backward compatibility: new-format
+      // callers (dirOpenScenario, for a scenario saved under this update)
+      // pass productionShift directly, so the user's exact original entry is
+      // shown rather than round-tripped through division. Legacy saved
+      // scenarios only carry machineTimeMin — derive the equivalent
+      // Production/Shift from it (DIR_SHIFT_MINUTES / machineTimeMin) so old
+      // scenarios keep opening and calculating exactly as before. A
+      // zero/invalid legacy machineTimeMin is left blank, requiring the user
+      // to enter a value before recalculating.
+      if ((productionShift === undefined || productionShift === null || productionShift === '') &&
+          isFinite(machineTimeMin) && machineTimeMin > 0) {
+        productionShift = DIR_SHIFT_MINUTES / machineTimeMin;
+      }
+      body.insertAdjacentHTML('beforeend', dirRoutingRowHTML(rowId, factory, department, wc, productionShift));
       const row = document.getElementById(`dir_routing_row_${rowId}`);
       if (factory) {
         const fSel = row.querySelector('select[data-rrow="factory"]');
@@ -9833,6 +9866,21 @@
     function dirDeleteRoutingRow(rowId) {
       const row = document.getElementById(`dir_routing_row_${rowId}`);
       if (row) row.remove();
+    }
+    // Live-updates the read-only "M.T. = … min/unit" helper under a routing
+    // row's Production / Shift input as the user types. Display-only — it
+    // never writes machineTimeMin anywhere; dirReadRoutingRows() remains the
+    // single source of truth that derives it at read time.
+    function dirUpdateRoutingMT(rowId) {
+      const row = document.getElementById(`dir_routing_row_${rowId}`);
+      if (!row) return;
+      const input = row.querySelector('[data-rrow="productionShift"]');
+      const display = row.querySelector('[data-rrow="mtDisplay"]');
+      if (!input || !display) return;
+      const productionShift = parseFloat(input.value);
+      display.textContent = (isFinite(productionShift) && productionShift > 0)
+        ? (DIR_SHIFT_MINUTES / productionShift).toFixed(3)
+        : '—';
     }
     // Factory changed -> rebuild the Department dropdown (options scoped to
     // this Factory only) and clear the now-stale Work Center dropdown.
@@ -9858,15 +9906,30 @@
 
     function dirReadRoutingRows() {
       const rows = [];
+      let hasInvalidProductionShift = false;
       document.querySelectorAll('#dir_routingBody tr').forEach(tr => {
         const factory = tr.querySelector('[data-rrow="factory"]')?.value || '';
         const department = tr.querySelector('[data-rrow="department"]')?.value || '';
         const wc = tr.querySelector('[data-rrow="wc"]')?.value || '';
-        const machTime = parseFloat(tr.querySelector('[data-rrow="machTime"]')?.value || '0') || 0;
-        if (wc) {
-          rows.push({ factory, department, workCenter: wc, machineTimeMin: machTime });
+        if (!wc) return; // unchanged: a row with no Work Center selected is ignored
+        const rawProductionShift = tr.querySelector('[data-rrow="productionShift"]')?.value;
+        const productionShift = parseFloat(rawProductionShift);
+        if (!rawProductionShift || !isFinite(productionShift) || productionShift <= 0) {
+          hasInvalidProductionShift = true;
+          return;
         }
+        // machineTimeMin is derived here and is what the existing EMS engine
+        // (dirCalcWCRowWithReservation / dirCalcMonthDifferentWithReservation /
+        // dirCalcMonthSimilarWithReservation — all untouched) actually
+        // consumes; productionShift is retained alongside it purely for
+        // persistence/display (spec: EMS What-If routing — Production/Shift).
+        const machineTimeMin = DIR_SHIFT_MINUTES / productionShift;
+        rows.push({ factory, department, workCenter: wc, productionShift, machineTimeMin });
       });
+      if (hasInvalidProductionShift) {
+        alert('Production / Shift must be greater than 0.');
+        return null;
+      }
       return rows;
     }
     function dirReadMonthlyQuantities() {
@@ -10027,6 +10090,7 @@
 
     function dirCalculateScenario() {
       const scenario = dirBuildScenarioFromForm();
+      if (scenario.routing === null) return; // dirReadRoutingRows() already alerted (invalid Production / Shift)
       if (!isFinite(scenario.startPeriod) || !isFinite(scenario.endPeriod) || scenario.endPeriod < scenario.startPeriod) {
         alert('Please select a valid Start Month and End Month (End must not be before Start).');
         return;
@@ -10175,7 +10239,7 @@
                           <th class="px-2.5 py-1.5 text-left font-semibold">Factory</th>
                           <th class="px-2.5 py-1.5 text-left font-semibold">Department</th>
                           <th class="px-2.5 py-1.5 text-left font-semibold">Work Center</th>
-                          <th class="px-2.5 py-1.5 text-right font-semibold">Machine Time</th>
+                          <th class="px-2.5 py-1.5 text-right font-semibold">M.T. (min/unit)</th>
                           <th class="px-2.5 py-1.5 text-right font-semibold">Machine Demand</th>
                           <th class="px-2.5 py-1.5 text-right font-semibold">Idle Machine Time</th>
                           <th class="px-2.5 py-1.5 text-right font-semibold">Remaining Capacity</th>
@@ -10252,6 +10316,7 @@
     //    by side for every saved scenario) ──
     function dirSaveScenario() {
       const scenario = dirBuildScenarioFromForm();
+      if (scenario.routing === null) return; // dirReadRoutingRows() already alerted (invalid Production / Shift)
       if (!isFinite(scenario.startPeriod) || !isFinite(scenario.endPeriod) || scenario.endPeriod < scenario.startPeriod) {
         alert('Please select a valid Start Month and End Month before saving.');
         return;
@@ -10325,7 +10390,7 @@
         if (inp) inp.value = scenario.monthlyQuantities[p];
       });
       document.getElementById('dir_routingBody').innerHTML = '';
-      (scenario.routing || []).forEach(r => dirAddRoutingRow(r.factory, r.department, r.workCenter, r.machineTimeMin));
+      (scenario.routing || []).forEach(r => dirAddRoutingRow(r.factory, r.department, r.workCenter, r.machineTimeMin, r.productionShift));
       const rc = document.getElementById('dir_resultCard');
       rc.classList.add('hidden'); rc.innerHTML = '';
       if (scenario.results) { _dirCurrentScenario = scenario; _dirCurrentResults = scenario.results; dirRenderResultCard(scenario, scenario.results); }
