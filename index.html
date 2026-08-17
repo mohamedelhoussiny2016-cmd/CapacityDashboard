@@ -4015,6 +4015,7 @@
       }
 
       // ── v45 NEW (spec section 3) — Duplicate Routing Across Factories ──
+      // [ORIGINAL BEHAVIOR, PRESERVED HERE FOR CONTEXT — now disabled below]
       // A SEPARATE check from the dedup above. Flags a Material whose routing
       // resolves into MORE THAN ONE Factory (via each routing row's Work
       // Center → wcMap → factory) — explicitly NOT keyed on Work Center, so
@@ -4024,45 +4025,38 @@
       // actually feed routingMap below) so this reflects the real routing
       // data the engine uses, not raw unfiltered input. Read-only — does not
       // remove/alter any routing row; purely a reporting pass.
-      const materialFactoryMap = new Map(); // material -> Map<factoryKey, {factory, workCenters:Set}>
-      dedupedRouting.forEach(row => {
-        const material = row[COLUMNS.ROUTING_MATERIAL];
-        const wc       = row[COLUMNS.ROUTING_WC];
-        if (!material || !wc) return;
-        const wcTrim = String(wc).trim();
-        const wi = wcMap.get(wcTrim);
-        const factory = wi ? wi.factory : 'Unknown';
-        const fk = normalizeFactoryKey(factory);
-        if (!fk) return;
-        if (!materialFactoryMap.has(material)) materialFactoryMap.set(material, new Map());
-        const factMap = materialFactoryMap.get(material);
-        if (!factMap.has(fk)) factMap.set(fk, { factory, workCenters: new Set() });
-        factMap.get(fk).workCenters.add(wcTrim);
-      });
-      let crossFactoryDupCount = 0;
-      materialFactoryMap.forEach((factMap, material) => {
-        if (factMap.size <= 1) return; // single factory — not a cross-factory duplicate
-        crossFactoryDupCount++;
-        const factories = Array.from(factMap.values()); // [{factory, workCenters:Set}, ...]
-        // One row per pairwise combination so 3+ factories are ALL shown clearly, not just the first two.
-        for (let i = 0; i < factories.length; i++) {
-          for (let j = i + 1; j < factories.length; j++) {
-            validationDetails.dupRoutingAcrossFactories.push({
-              material,
-              factory1: factories[i].factory,
-              workCenter1: Array.from(factories[i].workCenters).join(', '),
-              factory2: factories[j].factory,
-              workCenter2: Array.from(factories[j].workCenters).join(', '),
-              factoryCount: factories.length,
-              status: '⚠ Duplicate Routing Across Factories'
-            });
-          }
-        }
-      });
-      validationStats.routing.dupAcrossFactories = crossFactoryDupCount;
-      if (crossFactoryDupCount > 0) {
-        addValidationWarning(`⚠ Duplicate Routing Across Factories: ${crossFactoryDupCount} material(s) routed in more than one Factory — see the itemized table below.`, 'warning');
-      }
+      //
+      // BUSINESS-RULE PATCH: a Material is explicitly ALLOWED to exist in
+      // multiple Factories — this is legitimate data (e.g. AFSGY-F030JBKZ
+      // routed under PCB 2/Aimex AND PCB 1/FBECKDA1), not an error, and must
+      // never be reported as "Duplicate Routing Across Factories" — for any
+      // Material, generically, not a hard-coded example. The flagging logic
+      // that used to populate validationDetails.dupRoutingAcrossFactories is
+      // therefore switched off below; the counter is explicitly held at 0 so
+      // the validation summary correctly reads 0 instead of stale data, and
+      // the itemized report table (dupRoutingAcrossFactoriesSection) already
+      // hides itself whenever validationDetails.dupRoutingAcrossFactories is
+      // empty (see its render code), so no further UI change is needed.
+      //
+      // This is a reporting-only change. It does NOT touch:
+      //  - the within-Factory duplicate-routing check just above
+      //    (routingDedupeSet, keyed on material+workCenter+machineTime+
+      //    laborTime — independent of Factory, still runs exactly as before);
+      //  - routingMap below, which already stores EVERY routing row per
+      //    Material as an array (never overwrites), so both Factories' rows
+      //    already survive intact regardless of this check;
+      //  - the Machine/Labor Need calculation in calculateMonthly(). At the
+      //    time of THIS patch it still fanned out each Plan row only to
+      //    routing entries whose Work Center belonged to that row's own
+      //    Factory when a Material spanned multiple Factories — a separate,
+      //    narrower bug than the one this patch addresses: it didn't just
+      //    mis-flag a duplicate, it silently DROPPED a Material's quantity
+      //    from a legitimately-routed Work Center whenever the Plan row's
+      //    Factory didn't match (e.g. the AFSGY-F030JBKZ/Aimex case above).
+      //    That exclusion has since been removed by the "v49 BUSINESS-RULE
+      //    UPDATE" in calculateMonthly() below — Routing alone now decides
+      //    Work Center membership there too, with no Factory comparison.
+      validationStats.routing.dupAcrossFactories = 0;
 
       const routingMap = new Map();
       const wcWeightedData = new Map();
@@ -4252,50 +4246,43 @@
         const routingEntries = routingMap.get(material) || [];
         if (routingEntries.length === 0) return;
 
-        // v45 NEW (spec sections 2/14/15) — Factory-aware routing linkage.
-        // Precompute, once per material, the set of DISTINCT factories this
-        // material's routing entries actually span (via each entry's Work
-        // Center → wcMap → factory). Only when a material genuinely routes
-        // into MORE THAN ONE factory does factory-matching apply below —
-        // this is the exact scenario from the cross-factory validation
-        // example (same Material, different Work Centers in different
-        // factories). When every routing entry for this material belongs to
-        // the same single factory (the overwhelming common case, and every
-        // legacy dataset with no Factory column at all), behavior is
-        // UNCHANGED from before — no filtering is applied.
-        const routingFactorySet = new Set();
-        routingEntries.forEach(e => {
-          const wi = wcMap.get(e.workCenter);
-          const fk = normalizeFactoryKey(wi ? wi.factory : '');
-          if (fk) routingFactorySet.add(fk);
-        });
-        const routingSpansMultipleFactories = routingFactorySet.size > 1;
+        // v49 BUSINESS-RULE UPDATE — Factory is no longer a reason to
+        // exclude a valid Routing record from a Work Center calculation.
+        //
+        // [REPLACES the v45 "Factory-aware routing linkage" fan-out filter
+        // that previously lived here.] That filter compared each Plan row's
+        // Factory against a Routing entry's own Work Center Factory (via
+        // wcMap) and SKIPPED the entry — excluding this material's quantity
+        // from that Work Center's Machine/Labor Need entirely — whenever the
+        // two Factories didn't match and this material's routing spanned
+        // more than one Factory.
+        //
+        // Corrected rule: the Routing file alone determines which Work
+        // Center(s) a Material belongs to for capacity calculation. If a
+        // Material has a valid Routing record for a Work Center, it is
+        // included in that Work Center's calculation regardless of whether
+        // the Plan row's Factory matches that Work Center's Factory (e.g. a
+        // Plan row under Factory "PCB 1" whose Routing points to a Work
+        // Center whose own Factory is "PCB 2" is still fully counted there).
+        // No Factory comparison is performed below any more.
+        //
+        // This does not change how many times anything is counted: the loop
+        // structure below is unchanged, so each Plan row still contributes
+        // its quantity to EVERY routing entry for this material EXACTLY
+        // once — the same "one plan row × one routing entry" fan-out
+        // already used for same-Factory materials. A Material legitimately
+        // routed to several Work Centers still contributes fully to each of
+        // them, and the existing Material+WC+Time routing-deduplication
+        // above (which this filter never touched) still prevents true
+        // duplicate routing rows from being double-counted.
 
         planRows.forEach(planRow => {
-          // v45 NEW — this Plan row's Factory (blank/undefined for legacy
-          // files with no Factory column — falsy, so the filter below never
-          // activates for them; full backward compatibility).
-          const planRowFactory = normalizeFactoryKey(planRow[COLUMNS.PLAN_FACTORY]);
-
           monthCols.forEach(monthCol => {
             const period  = monthCol.period;
             const rawQty  = safeNumber(planRow[monthCol.name]);
             if (rawQty <= 0) return;
 
             routingEntries.forEach(entry => {
-              // v45 NEW (spec sections 2/14/15) — when this Plan row declares
-              // a Factory AND this material's routing genuinely spans more
-              // than one factory, only fan out to the routing entry(ies)
-              // whose Work Center belongs to THAT factory. Prevents a PCB1
-              // plan row's quantity from being counted against a PCB2 Work
-              // Center's demand (and vice versa) merely because they share a
-              // Material — the exact "Do not accidentally combine PCB 1 +
-              // PCB 2 into one quantity" requirement.
-              if (planRowFactory && routingSpansMultipleFactories) {
-                const wiEntry = wcMap.get(entry.workCenter);
-                const entryFactory = normalizeFactoryKey(wiEntry ? wiEntry.factory : '');
-                if (entryFactory && entryFactory !== planRowFactory) return; // different factory — skip this routing entry for this plan row
-              }
               // Plan Reduction: apply the factor only to records inside the
               // selected Factory / Department / Work Center / Month scope.
               // Records outside that scope keep their original quantity.
@@ -4384,10 +4371,13 @@
           // instead). Reuses the SAME definition calculateCapacity() already
           // uses for its own (yearly) `planPCB` field — raw accumulated plan
           // quantity — just at monthly granularity; no new/duplicated
-          // calculation engine. Now factory-aware via the routing fan-out
-          // fix above (wcPlanQtyMap only accumulates quantity that survived
-          // the factory-matching filter), so a factory-specific view never
-          // combines e.g. PCB 1 + PCB 2 into one number.
+          // calculation engine. v49 UPDATE: wcPlanQtyMap now accumulates
+          // every Plan row's quantity that has a valid Routing record for
+          // this Work Center, regardless of that Plan row's own Factory —
+          // the Factory-based exclusion that used to gate this (see the
+          // "v49 BUSINESS-RULE UPDATE" comment above in this same function)
+          // has been removed: Routing, not Plan Factory, determines Work
+          // Center membership.
           planPCB:     Math.round(wcPlanQtyMap.get(key) || 0)
         };
       });
